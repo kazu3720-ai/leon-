@@ -1,0 +1,10 @@
+# 秘密情報（絶対にGitHubに上げない）
+.env
+
+# 依存パッケージ
+node_modules/
+
+# その他
+.DS_Store
+*.log
+npm-debug.log*
