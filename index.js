@@ -474,6 +474,10 @@ app.post(
     }
 
     const sig = req.headers['stripe-signature'];
+    if (!sig) {
+      console.error('Stripe webhook called without signature header.');
+      return res.status(400).send('Missing Stripe signature');
+    }
     let event;
 
     try {
