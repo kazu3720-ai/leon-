@@ -107,8 +107,11 @@ async function createCheckoutSessionForGroup(lineGroupId) {
   const session = await stripe.checkout.sessions.create({
     mode: 'subscription',
     line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
-    success_url: `${BASE_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${BASE_URL}/subscription/cancel`,
+    success_url: `${BASE_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${BASE_URL}/cancel`,
+    metadata: {
+      line_group_id: lineGroupId,
+    },
     allow_promotion_codes: true,
     subscription_data: {
       metadata: { line_group_id: lineGroupId },
@@ -259,7 +262,7 @@ async function handleEvent(event) {
       if (!customerId) {
         await lineClient.replyMessage(replyToken, {
           type: 'text',
-          text: '現在プレミアムプランのご契約はありませんのでご安心ください！もし使い放題にしたい場合は「課金」と送ってくださいね。',
+          text: '決済データが見つかりません。プレミアムプランのご契約状況に心当たりがない場合は、そのままご安心ください。再度ご利用いただく場合は「課金」と送ってくださいね。',
         });
         return;
       }
@@ -431,10 +434,10 @@ app.get('/', (req, res) => {
 });
 
 // Stripe Checkout 完了・キャンセル後のリダイレクト用（代表者がブラウザで開く）
-app.get('/subscription/success', (req, res) => {
+app.get('/success', (req, res) => {
   res.send('<p>お支払いが完了しました。LINEのグループでレオンくんをそのままお使いください。</p>');
 });
-app.get('/subscription/cancel', (req, res) => {
+app.get('/cancel', (req, res) => {
   res.send('<p>お支払いをキャンセルしました。また「課金」と送っていただければお申し込みいただけます。</p>');
 });
 app.get('/subscription/portal-return', (req, res) => {
@@ -443,7 +446,7 @@ app.get('/subscription/portal-return', (req, res) => {
 
 // LINE Webhook：署名検証付き。body parser は middleware が担当するため、ここでは未使用
 app.post(
-  '/webhook',
+  '/callback',
   middleware({
     channelSecret: lineConfig.channelSecret,
   }),
@@ -457,6 +460,81 @@ app.post(
         console.error('handleEvent error:', err);
       }
     }
+  }
+);
+
+// Stripe Webhook：支払い完了・解約などのイベントを受信して Supabase を更新
+app.post(
+  '/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+      console.error('Stripe or STRIPE_WEBHOOK_SECRET is not configured.');
+      return res.status(500).send('Stripe is not configured');
+    }
+
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('Stripe webhook signature verification failed:', err);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    const eventType = event.type;
+    const object = event.data?.object || {};
+
+    try {
+      // 支払い完了（サブスク開始）
+      if (eventType === 'checkout.session.completed') {
+        const session = object;
+        const lineGroupId = session.metadata?.line_group_id;
+        const customerId = session.customer;
+
+        if (supabase && lineGroupId && customerId) {
+          const { error } = await supabase
+            .from('line_groups')
+            .upsert(
+              {
+                line_group_id: lineGroupId,
+                stripe_customer_id: customerId,
+                plan: 'premium',
+              },
+              { onConflict: 'line_group_id' }
+            );
+          if (error) {
+            console.error('Supabase upsert on checkout.session.completed error:', error);
+          }
+        }
+      }
+
+      // サブスクリプション解約
+      if (eventType === 'customer.subscription.deleted') {
+        const subscription = object;
+        const lineGroupId = subscription.metadata?.line_group_id;
+
+        if (supabase && lineGroupId) {
+          const { error } = await supabase
+            .from('line_groups')
+            .update({ plan: 'free' })
+            .eq('line_group_id', lineGroupId);
+          if (error) {
+            console.error('Supabase update on customer.subscription.deleted error:', error);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Stripe webhook handler error:', err);
+      // Stripe Webhook には 2xx を返さないと再送され続けるため、ここでも 200 を返しておく
+    }
+
+    res.json({ received: true });
   }
 );
 
