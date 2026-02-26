@@ -428,12 +428,101 @@ async function handleEvent(event) {
 // ========== Express サーバー ==========
 const app = express();
 
+// Stripe Webhook は必ず「最初」に定義（他ルートの body parser に触られないよう Raw で受ける）
+app.post(
+  '/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    console.log('[Stripe Webhook] STRIPE_WEBHOOK_SECRET (先頭8文字):', secret ? `${secret.substring(0, 8)}...` : 'undefined');
+
+    if (!stripe || !secret) {
+      console.error('Stripe or STRIPE_WEBHOOK_SECRET is not configured.');
+      return res.status(500).send('Stripe is not configured');
+    }
+
+    const sig = req.headers['stripe-signature'];
+    if (!sig) {
+      console.error('Stripe webhook called without signature header.');
+      return res.status(400).send('Missing Stripe signature');
+    }
+
+    const rawBody = req.body;
+    const isBuffer = Buffer.isBuffer(rawBody);
+    console.log('[Stripe Webhook] req.body is Buffer:', isBuffer, typeof rawBody);
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(rawBody, sig, secret);
+    } catch (err) {
+      console.error('Stripe webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    const eventType = event.type;
+    const object = event.data?.object || {};
+    console.log('[Stripe Webhook] event.type:', eventType);
+
+    try {
+      if (eventType === 'checkout.session.completed') {
+        const session = object;
+        const lineGroupId = session.metadata?.line_group_id;
+        const customerId = session.customer;
+
+        console.log('[Stripe Webhook] checkout.session.completed — line_group_id:', lineGroupId, 'customerId:', customerId);
+
+        if (supabase && lineGroupId && customerId) {
+          const { data, error } = await supabase
+            .from('line_groups')
+            .upsert(
+              {
+                line_group_id: lineGroupId,
+                stripe_customer_id: customerId,
+                plan: 'premium',
+              },
+              { onConflict: 'line_group_id' }
+            );
+          if (error) {
+            console.error('[Stripe Webhook] Supabase upsert 失敗:', error.message, 'code:', error.code, 'details:', error.details);
+          } else {
+            console.log('[Stripe Webhook] Supabase upsert 成功 — line_group_id:', lineGroupId);
+          }
+        } else {
+          console.log('[Stripe Webhook] upsert スキップ — supabase:', !!supabase, 'line_group_id:', lineGroupId, 'customerId:', !!customerId);
+        }
+      }
+
+      if (eventType === 'customer.subscription.deleted') {
+        const subscription = object;
+        const lineGroupId = subscription.metadata?.line_group_id;
+        console.log('[Stripe Webhook] customer.subscription.deleted — line_group_id:', lineGroupId);
+
+        if (supabase && lineGroupId) {
+          const { error } = await supabase
+            .from('line_groups')
+            .update({ plan: 'free' })
+            .eq('line_group_id', lineGroupId);
+          if (error) {
+            console.error('[Stripe Webhook] Supabase update(plan=free) 失敗:', error.message, 'code:', error.code, 'details:', error.details);
+          } else {
+            console.log('[Stripe Webhook] Supabase update(plan=free) 成功 — line_group_id:', lineGroupId);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Stripe webhook handler error:', err);
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// 以下は JSON body を扱わないため、Stripe の Raw body に干渉しない
 // ヘルスチェック（Render や LB 用）
 app.get('/', (req, res) => {
   res.send('返信代行 レオンくん is running.');
 });
 
-// Stripe Checkout 完了・キャンセル後のリダイレクト用（代表者がブラウザで開く）
 app.get('/success', (req, res) => {
   res.send('<p>お支払いが完了しました。LINEのグループでレオンくんをそのままお使いください。</p>');
 });
@@ -444,7 +533,7 @@ app.get('/subscription/portal-return', (req, res) => {
   res.send('<p>お手続きありがとうございます。LINEのグループに戻って、レオンくんとの会話を続けていただけます。</p>');
 });
 
-// LINE Webhook：署名検証付き。body parser は middleware が担当するため、ここでは未使用
+// LINE Webhook：署名検証付き。body parser は middleware が担当（Stripe の /webhook とは別）
 app.post(
   '/callback',
   middleware({
@@ -460,85 +549,6 @@ app.post(
         console.error('handleEvent error:', err);
       }
     }
-  }
-);
-
-// Stripe Webhook：支払い完了・解約などのイベントを受信して Supabase を更新
-app.post(
-  '/webhook',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-      console.error('Stripe or STRIPE_WEBHOOK_SECRET is not configured.');
-      return res.status(500).send('Stripe is not configured');
-    }
-
-    const sig = req.headers['stripe-signature'];
-    if (!sig) {
-      console.error('Stripe webhook called without signature header.');
-      return res.status(400).send('Missing Stripe signature');
-    }
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error('Stripe webhook signature verification failed:', err);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    const eventType = event.type;
-    const object = event.data?.object || {};
-
-    try {
-      // 支払い完了（サブスク開始）
-      if (eventType === 'checkout.session.completed') {
-        const session = object;
-        const lineGroupId = session.metadata?.line_group_id;
-        const customerId = session.customer;
-
-        if (supabase && lineGroupId && customerId) {
-          const { error } = await supabase
-            .from('line_groups')
-            .upsert(
-              {
-                line_group_id: lineGroupId,
-                stripe_customer_id: customerId,
-                plan: 'premium',
-              },
-              { onConflict: 'line_group_id' }
-            );
-          if (error) {
-            console.error('Supabase upsert on checkout.session.completed error:', error);
-          }
-        }
-      }
-
-      // サブスクリプション解約
-      if (eventType === 'customer.subscription.deleted') {
-        const subscription = object;
-        const lineGroupId = subscription.metadata?.line_group_id;
-
-        if (supabase && lineGroupId) {
-          const { error } = await supabase
-            .from('line_groups')
-            .update({ plan: 'free' })
-            .eq('line_group_id', lineGroupId);
-          if (error) {
-            console.error('Supabase update on customer.subscription.deleted error:', error);
-          }
-        }
-      }
-    } catch (err) {
-      console.error('Stripe webhook handler error:', err);
-      // Stripe Webhook には 2xx を返さないと再送され続けるため、ここでも 200 を返しておく
-    }
-
-    res.json({ received: true });
   }
 );
 
