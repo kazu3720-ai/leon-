@@ -23,16 +23,9 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
-// Supabase: 環境変数は .trim() で前後の空白を除去してから使用（/webhook 内でもこのクライアントを参照）
-let supabaseUrl = (process.env.SUPABASE_URL || '').trim();
+// Supabase: 環境変数を .trim() するだけ。URL の書き換えは行わない（.co のまま渡す）
+const supabaseUrl = (process.env.SUPABASE_URL || '').trim();
 const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-
-// .co → .com 自動補正（Supabase の正しいドメインは .com）
-if (supabaseUrl && supabaseUrl.endsWith('.co') && !supabaseUrl.endsWith('.com')) {
-  const before = supabaseUrl;
-  supabaseUrl = supabaseUrl.replace(/\.co$/, '.com');
-  console.log('[Supabase] URL を .co → .com に補正しました:', before.substring(0, 20) + '...' + before.slice(-6), '→', supabaseUrl.substring(0, 20) + '...' + supabaseUrl.slice(-8));
-}
 
 // 住所の徹底検証：先頭・末尾・文字数をログ（中間は隠す）
 if (supabaseUrl) {
@@ -57,7 +50,7 @@ if (supabaseUrl) {
   checkSupabaseDns(supabaseUrl).catch((e) => console.error('[Supabase] DNS check error:', e));
 }
 
-// クライアント作成（オプションで安定化）
+// createClient には Render の環境変数で設定した URL をそのまま渡す（.co / .com いずれも変更しない）
 const supabase =
   supabaseUrl && supabaseKey
     ? createClient(supabaseUrl, supabaseKey, {
