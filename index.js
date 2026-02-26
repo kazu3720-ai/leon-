@@ -27,6 +27,15 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
     : null;
 
+// 起動時に Supabase 環境変数が読み込まれているか確認（Webhook で DB 更新するために必須）
+(function logSupabaseEnv() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  console.log('[Startup] SUPABASE_URL:', url ? `${url.substring(0, 30)}...` : 'undefined');
+  console.log('[Startup] SUPABASE_SERVICE_ROLE_KEY:', key ? `${key.substring(0, 8)}...` : 'undefined');
+  console.log('[Startup] supabase client:', supabase ? 'OK' : 'NG (DB更新はスキップされます)');
+})();
+
 /** レオンくんの魂（System Prompt）＋ 絶対ルール */
 const LEON_SYSTEM_PROMPT = `あなたは単なる翻訳機ではありません。地方の老舗旅館で、毎日夜中までインバウンド対応に疲弊している女将さんを救うために生まれた、最強のデジタル右腕『レオンくん』です。女将さんの時間を1秒でも削ること、そして日本の旅館の温かい人柄と最高のおもてなしの心を外国人客に完璧に伝えることがあなたの最大の使命です。出力する文章には、女将らしい上品さと温かみを込めてください。
 
@@ -488,7 +497,10 @@ app.post(
             console.log('[Stripe Webhook] Supabase upsert 成功 — line_group_id:', lineGroupId);
           }
         } else {
+          const url = process.env.SUPABASE_URL;
+          const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
           console.log('[Stripe Webhook] upsert スキップ — supabase:', !!supabase, 'line_group_id:', lineGroupId, 'customerId:', !!customerId);
+          console.log('[Stripe Webhook] 現在の環境変数 — SUPABASE_URL:', url ? '設定あり' : 'undefined', 'SUPABASE_SERVICE_ROLE_KEY:', key ? '設定あり' : 'undefined');
         }
       }
 
@@ -507,6 +519,8 @@ app.post(
           } else {
             console.log('[Stripe Webhook] Supabase update(plan=free) 成功 — line_group_id:', lineGroupId);
           }
+        } else if (!supabase) {
+          console.log('[Stripe Webhook] update スキップ — supabase 未設定。SUPABASE_URL:', !!process.env.SUPABASE_URL, 'SUPABASE_SERVICE_ROLE_KEY:', !!process.env.SUPABASE_SERVICE_ROLE_KEY);
         }
       }
     } catch (err) {
