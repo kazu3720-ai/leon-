@@ -69,6 +69,20 @@ function getGroupId(event) {
   return event.source?.type === 'group' ? event.source.groupId : null;
 }
 
+function isAdminUser(userId) {
+  return !!process.env.ADMIN_USER_ID && userId === process.env.ADMIN_USER_ID;
+}
+
+function isTestGroupId(groupId) {
+  if (!groupId) return false;
+  const raw = process.env.ADMIN_TEST_GROUP_IDS || '';
+  const ids = raw
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+  return ids.includes(groupId);
+}
+
 /** グループが Premium 利用可能か（契約あり・期限内） */
 async function isGroupPremium(lineGroupId) {
   if (!supabase) return false; // Supabase 未設定時は課金必須（未契約扱い）
@@ -170,47 +184,153 @@ async function handleEvent(event) {
   const text = event.message.text.trim();
   const replyToken = event.replyToken;
 
-  // ---------- グループ判定：個人チャットでは案内のみ ----------
-  if (!isGroupEvent(event)) {
+  const isGroup = isGroupEvent(event);
+  const groupId = getGroupId(event);
+  const isAdmin = isAdminUser(userId);
+  const isTestGroup = isTestGroupId(groupId);
+  const bypassBilling = isAdmin || isTestGroup;
+
+  // ---------- 個人チャット：開発者以外は案内のみ ----------
+  if (!isGroup && !isAdmin) {
     await lineClient.replyMessage(replyToken, {
       type: 'text',
-      text: 'レオンくんはスタッフのLINEグループに招待してご利用ください。グループで「【モード切替：メール】」や「【モード切替：クチコミ】」からお試しください。',
+      text: 'レオンくんはスタッフのLINEグループに招待してご利用ください。グループで「メール」や「クチコミ」からお試しください。',
     });
     return;
   }
 
-  const groupId = getGroupId(event);
-
-  // ---------- 課金チェック：未契約なら課金案内 or Checkout URL 返却 ----------
-  const premium = await isGroupPremium(groupId);
-  if (!premium) {
-    if (text === '課金する') {
-      try {
-        await ensureGroupRow(groupId);
-        const { url } = await createCheckoutSessionForGroup(groupId);
-        await lineClient.replyMessage(replyToken, {
-          type: 'text',
-          text: `お支払いページはこちらです。代表者の方が完了してください。\n割引クーポンをお持ちの方は支払い画面でご利用いただけます。\n\n${url}`,
-        });
-      } catch (err) {
-        console.error('createCheckoutSessionForGroup error:', err);
-        await lineClient.replyMessage(replyToken, {
-          type: 'text',
-          text: '申し訳ございません。お支払いページの作成に失敗しました。しばらく経ってから「課金する」と再度送ってください。',
-        });
-      }
+  // ---------- 迷わせない「課金」導線 ----------
+  if (text === '課金') {
+    if (!isGroup) {
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: '課金のお手続きは、実際にご利用になるスタッフ用のLINEグループから「課金」と送っていただく必要があります。対象のグループでお試しください。',
+      });
       return;
     }
+    try {
+      await ensureGroupRow(groupId);
+      const { url } = await createCheckoutSessionForGroup(groupId);
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: `こちらからプレミアムプラン（月額制）のお手続きが可能です。割引クーポンをお持ちの方は支払い画面でご入力ください！ 💳\n${url}`,
+      });
+    } catch (err) {
+      console.error('createCheckoutSessionForGroup error:', err);
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: '申し訳ございません。一時的なエラーです。少し時間をおいてから、もう一度「課金」と送ってください。',
+      });
+    }
+    return;
+  }
+
+  // ---------- 世界一誠実な「解約・管理」 ----------
+  if (text === '解約') {
+    if (!isGroup) {
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: '解約やご利用状況の確認は、実際にご利用中のスタッフ用グループから「解約」と送っていただく必要があります。対象のグループでお試しください。',
+      });
+      return;
+    }
+    if (!supabase) {
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: '申し訳ございません。一時的なエラーです。少し時間をおいてから、もう一度「解約」と送ってください。',
+      });
+      return;
+    }
+    try {
+      const { data, error } = await supabase
+        .from('line_groups')
+        .select('stripe_customer_id')
+        .eq('line_group_id', groupId)
+        .single();
+      if (error) {
+        console.error('Supabase stripe_customer_id fetch error:', error);
+        await lineClient.replyMessage(replyToken, {
+          type: 'text',
+          text: '申し訳ございません。一時的なエラーです。少し時間をおいてから、もう一度「解約」と送ってください。',
+        });
+        return;
+      }
+      const customerId = data?.stripe_customer_id;
+      if (!customerId) {
+        await lineClient.replyMessage(replyToken, {
+          type: 'text',
+          text: '現在プレミアムプランのご契約はありませんのでご安心ください！もし使い放題にしたい場合は「課金」と送ってくださいね。',
+        });
+        return;
+      }
+      if (!stripe) {
+        await lineClient.replyMessage(replyToken, {
+          type: 'text',
+          text: '申し訳ございません。一時的なエラーです。少し時間をおいてから、もう一度「解約」と送ってください。',
+        });
+        return;
+      }
+      const portalSession = await stripe.billingPortal.sessions.create({
+        customer: customerId,
+        return_url: `${BASE_URL}/subscription/portal-return`,
+      });
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: `いつでもこちらから解約、カード情報の変更、領収書の確認が可能です。ご利用ありがとうございました！ 🚪\n${portalSession.url}`,
+      });
+    } catch (err) {
+      console.error('billingPortal.sessions.create error:', err);
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: '申し訳ございません。一時的なエラーです。少し時間をおいてから、もう一度「解約」と送ってください。',
+      });
+    }
+    return;
+  }
+
+  // ---------- 爆速モード切り替え（キーワード） ----------
+  if (text === 'メール') {
+    setState(userId, STATES.MAIL_WAIT);
     await lineClient.replyMessage(replyToken, {
       type: 'text',
-      text: 'このグループでAI機能をご利用いただくには、月額課金が必要です。割引クーポンをお持ちの方は支払い画面でご利用いただけます。代表者の方は「課金する」と送ってください。',
+      text: '了解です！これからは「メール返信」をお手伝いします。返したい内容を教えてください！',
     });
     return;
+  }
+
+  if (text === 'クチコミ') {
+    setState(userId, STATES.REVIEW_WAIT);
+    await lineClient.replyMessage(replyToken, {
+      type: 'text',
+      text: '承知しました！「クチコミ返信」をお手伝いします。お客様のクチコミを貼り付けてください！',
+    });
+    return;
+  }
+
+  // ---------- 課金チェック：管理者・テストグループ以外はDBで確認 ----------
+  if (isGroup && !bypassBilling) {
+    try {
+      const premium = await isGroupPremium(groupId);
+      if (!premium) {
+        await lineClient.replyMessage(replyToken, {
+          type: 'text',
+          text: 'このグループでAI機能をご利用いただくには、月額課金が必要です。代表者の方は「課金」と送ってください。',
+        });
+        return;
+      }
+    } catch (err) {
+      console.error('isGroupPremium error:', err);
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: '申し訳ございません。一時的なエラーです。少し時間をおいてから、もう一度お試しください。',
+      });
+      return;
+    }
   }
 
   const state = getState(userId);
 
-  // ---------- モード切替 ----------
+  // ---------- モード切替（従来のトリガーも維持） ----------
   if (text === '【モード切替：メール】') {
     setState(userId, STATES.MAIL_WAIT);
     await lineClient.replyMessage(replyToken, {
@@ -315,7 +435,10 @@ app.get('/subscription/success', (req, res) => {
   res.send('<p>お支払いが完了しました。LINEのグループでレオンくんをそのままお使いください。</p>');
 });
 app.get('/subscription/cancel', (req, res) => {
-  res.send('<p>お支払いをキャンセルしました。また「課金する」と送っていただければお申し込みいただけます。</p>');
+  res.send('<p>お支払いをキャンセルしました。また「課金」と送っていただければお申し込みいただけます。</p>');
+});
+app.get('/subscription/portal-return', (req, res) => {
+  res.send('<p>お手続きありがとうございます。LINEのグループに戻って、レオンくんとの会話を続けていただけます。</p>');
 });
 
 // LINE Webhook：署名検証付き。body parser は middleware が担当するため、ここでは未使用
