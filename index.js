@@ -22,17 +22,18 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
+// Supabase: 環境変数は .trim() で前後の空白を除去してから使用（/webhook 内でもこのクライアントを参照）
+const supabaseUrl = (process.env.SUPABASE_URL || '').trim();
+const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const supabase =
-  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  supabaseUrl && supabaseKey
+    ? createClient(supabaseUrl, supabaseKey)
     : null;
 
 // 起動時に Supabase 環境変数が読み込まれているか確認（Webhook で DB 更新するために必須）
 (function logSupabaseEnv() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  console.log('[Startup] SUPABASE_URL:', url ? `${url.substring(0, 30)}...` : 'undefined');
-  console.log('[Startup] SUPABASE_SERVICE_ROLE_KEY:', key ? `${key.substring(0, 8)}...` : 'undefined');
+  console.log('[Startup] SUPABASE_URL:', supabaseUrl ? `${supabaseUrl.substring(0, 30)}...` : 'undefined');
+  console.log('[Startup] SUPABASE_SERVICE_ROLE_KEY:', supabaseKey ? `${supabaseKey.substring(0, 8)}...` : 'undefined');
   console.log('[Startup] supabase client:', supabase ? 'OK' : 'NG (DB更新はスキップされます)');
 })();
 
