@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const dns = require('node:dns').promises;
 const { Client, middleware } = require('@line/bot-sdk');
 const OpenAI = require('openai').default;
 const Stripe = require('stripe');
@@ -23,11 +24,46 @@ const stripe = process.env.STRIPE_SECRET_KEY
   : null;
 
 // Supabase: 環境変数は .trim() で前後の空白を除去してから使用（/webhook 内でもこのクライアントを参照）
-const supabaseUrl = (process.env.SUPABASE_URL || '').trim();
+let supabaseUrl = (process.env.SUPABASE_URL || '').trim();
 const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+
+// .co → .com 自動補正（Supabase の正しいドメインは .com）
+if (supabaseUrl && supabaseUrl.endsWith('.co') && !supabaseUrl.endsWith('.com')) {
+  const before = supabaseUrl;
+  supabaseUrl = supabaseUrl.replace(/\.co$/, '.com');
+  console.log('[Supabase] URL を .co → .com に補正しました:', before.substring(0, 20) + '...' + before.slice(-6), '→', supabaseUrl.substring(0, 20) + '...' + supabaseUrl.slice(-8));
+}
+
+// 住所の徹底検証：先頭・末尾・文字数をログ（中間は隠す）
+if (supabaseUrl) {
+  const len = supabaseUrl.length;
+  const head = supabaseUrl.substring(0, Math.min(12, len));
+  const tail = len > 14 ? supabaseUrl.slice(-10) : supabaseUrl;
+  console.log('[Supabase] URL Check:', head + (len > 22 ? '...' + tail : tail), '(計' + len + '文字)');
+}
+
+// DNS 解決の事前チェック（fetch 前に名前解決できるかテスト）
+async function checkSupabaseDns(url) {
+  if (!url) return;
+  try {
+    const hostname = new URL(url).hostname;
+    const result = await dns.lookup(hostname, { all: false });
+    console.log('[Supabase] DNS 解決 OK:', hostname, '→', result.address);
+  } catch (err) {
+    console.error('[Supabase] DNS 解決 FAIL:', err.hostname || new URL(url).hostname, 'code:', err.code, 'message:', err.message);
+  }
+}
+if (supabaseUrl) {
+  checkSupabaseDns(supabaseUrl).catch((e) => console.error('[Supabase] DNS check error:', e));
+}
+
+// クライアント作成（オプションで安定化）
 const supabase =
   supabaseUrl && supabaseKey
-    ? createClient(supabaseUrl, supabaseKey)
+    ? createClient(supabaseUrl, supabaseKey, {
+        auth: { persistSession: false },
+        global: { fetch: (...args) => fetch(...args) },
+      })
     : null;
 
 // 起動時に Supabase 環境変数が読み込まれているか確認（Webhook で DB 更新するために必須）
