@@ -15,8 +15,12 @@ const lineConfig = {
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const lineClient = new Client(lineConfig);
 
-/** レオンくんの魂（System Prompt） */
-const LEON_SYSTEM_PROMPT = `あなたは単なる翻訳機ではありません。地方の老舗旅館で、毎日夜中までインバウンド対応に疲弊している女将さんを救うために生まれた、最強のデジタル右腕『レオンくん』です。女将さんの時間を1秒でも削ること、そして日本の旅館の温かい人柄と最高のおもてなしの心を外国人客に完璧に伝えることがあなたの最大の使命です。出力する文章には、女将らしい上品さと温かみを込めてください。`;
+/** レオンくんの魂（System Prompt）＋ 絶対ルール */
+const LEON_SYSTEM_PROMPT = `あなたは単なる翻訳機ではありません。地方の老舗旅館で、毎日夜中までインバウンド対応に疲弊している女将さんを救うために生まれた、最強のデジタル右腕『レオンくん』です。女将さんの時間を1秒でも削ること、そして日本の旅館の温かい人柄と最高のおもてなしの心を外国人客に完璧に伝えることがあなたの最大の使命です。出力する文章には、女将らしい上品さと温かみを込めてください。
+
+【追加する絶対ルール（必ず守ること）】
+1. 相手の言語に合わせる: ユーザーから送られてきた元の文章（英語、中国語など）の言語を判別し、返信案は必ず「その言語と同じ言語」で作成すること。外国語で書かれた文章に対して、日本語だけで返信案を作成しないこと。
+2. 安心の日本語訳: ユーザー（女将さん）が内容を確認して安心できるよう、作成した外国語の返信案には必ず「日本語訳」をセットで出力すること。また、元の文章の日本語訳を最初に軽く添えると親切である。`;
 
 // ========== 状態管理（ユーザーID → { state, originalEmail? }） ==========
 const userState = new Map();
@@ -58,7 +62,7 @@ async function translateAndSummarize(emailText) {
   return completion.choices[0].message.content.trim();
 }
 
-/** 相手のメールと回答メモから、相手の言語で丁寧な返信文を作成 */
+/** 相手のメールと回答メモから、相手の言語で丁寧な返信文を作成（日本語訳付き） */
 async function createEmailReply(originalEmail, replyMemo) {
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -66,14 +70,14 @@ async function createEmailReply(originalEmail, replyMemo) {
       { role: 'system', content: LEON_SYSTEM_PROMPT },
       {
         role: 'user',
-        content: `【相手から届いたメール（原文）】\n${originalEmail}\n\n【女将さんが書きたい内容のメモ】\n${replyMemo}\n\n上記をもとに、相手のメールの言語に合わせた、丁寧な接客用の返信文を1通で作成してください。挨拶から締めまで、そのままコピーして使える形で出力してください。`,
+        content: `【相手から届いたメール（原文）】\n${originalEmail}\n\n【女将さんが書きたい内容のメモ】\n${replyMemo}\n\n上記をもとに、次の形式で出力してください。絶対ルールを守ること。\n\n■ 出力形式（この順で必ず出力）\n1. 「【元のメールの内容（日本語）】」見出しの下に、元メールの要点を日本語で1〜2行で簡潔に。\n2. 「【返信文（相手の言語）】」見出しの下に、相手のメールと同じ言語（英語なら英語、中国語なら中国語など）で丁寧な接客用の返信文を1通。そのままコピーして送れる形で。\n3. 「【日本語訳】」見出しの下に、上記返信文の日本語訳をそのまま記載。`,
       },
     ],
   });
   return completion.choices[0].message.content.trim();
 }
 
-/** クチコミに対する温かい返信文を作成 */
+/** クチコミに対する温かい返信文を作成（相手の言語＋日本語訳付き） */
 async function createReviewReply(reviewText) {
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -81,7 +85,7 @@ async function createReviewReply(reviewText) {
       { role: 'system', content: LEON_SYSTEM_PROMPT },
       {
         role: 'user',
-        content: `以下のお客様のクチコミに対して、旅館の女将として温かく上品な返信文を書いてください。感謝の気持ちと、またのお越しを歓迎する気持ちを込めて、そのままコピーして使える形で1通で出力してください。\n\n---\n${reviewText}`,
+        content: `以下のお客様のクチコミに対して、旅館の女将として温かく上品な返信文を書いてください。絶対ルールを守ること。\n\n■ 出力形式（この順で必ず出力）\n1. 「【元のクチコミの内容（日本語）】」見出しの下に、元のクチコミの要点を日本語で1〜2行で簡潔に。\n2. 「【返信文（相手の言語）】」見出しの下に、クチコミと同じ言語（英語なら英語、中国語なら中国語など）で温かい返信文を1通。感謝とまたのお越しを歓迎する気持ちを込め、そのままコピーして送れる形で。\n3. 「【日本語訳】」見出しの下に、上記返信文の日本語訳をそのまま記載。\n\n---\n${reviewText}`,
       },
     ],
   });
