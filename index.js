@@ -2,10 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const OpenAI = require('openai').default;
+const Stripe = require('stripe');
+const { createClient } = require('@supabase/supabase-js');
 
 // ========== 設定 ==========
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -14,6 +17,15 @@ const lineConfig = {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const lineClient = new Client(lineConfig);
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
+
+const supabase =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+    : null;
 
 /** レオンくんの魂（System Prompt）＋ 絶対ルール */
 const LEON_SYSTEM_PROMPT = `あなたは単なる翻訳機ではありません。地方の老舗旅館で、毎日夜中までインバウンド対応に疲弊している女将さんを救うために生まれた、最強のデジタル右腕『レオンくん』です。女将さんの時間を1秒でも削ること、そして日本の旅館の温かい人柄と最高のおもてなしの心を外国人客に完璧に伝えることがあなたの最大の使命です。出力する文章には、女将らしい上品さと温かみを込めてください。
@@ -43,6 +55,61 @@ function setState(userId, state, originalEmail = undefined) {
     return;
   }
   userState.set(userId, { state, originalEmail });
+}
+
+// ========== グループ課金（Supabase + Stripe） ==========
+
+/** イベントがグループチャット由来か */
+function isGroupEvent(event) {
+  return event.source?.type === 'group' && event.source?.groupId;
+}
+
+/** グループIDを取得（グループでない場合は null） */
+function getGroupId(event) {
+  return event.source?.type === 'group' ? event.source.groupId : null;
+}
+
+/** グループが Premium 利用可能か（契約あり・期限内） */
+async function isGroupPremium(lineGroupId) {
+  if (!supabase) return false; // Supabase 未設定時は課金必須（未契約扱い）
+  const { data, error } = await supabase
+    .from('line_groups')
+    .select('plan, trial_ends_at, current_period_end')
+    .eq('line_group_id', lineGroupId)
+    .single();
+  if (error || !data) return false;
+  const now = new Date().toISOString();
+  const plan = data.plan;
+  if (plan === 'trial' && data.trial_ends_at && data.trial_ends_at > now) return true;
+  if ((plan === 'premium' || plan === 'canceled') && data.current_period_end && data.current_period_end > now) return true;
+  return false;
+}
+
+/** Stripe Checkout Session を作成（プロモーションコード対応）。グループ課金用 API。 */
+async function createCheckoutSessionForGroup(lineGroupId) {
+  if (!stripe || !process.env.STRIPE_PRICE_ID) {
+    throw new Error('Stripe is not configured (STRIPE_SECRET_KEY, STRIPE_PRICE_ID)');
+  }
+  const session = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+    success_url: `${BASE_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${BASE_URL}/subscription/cancel`,
+    allow_promotion_codes: true,
+    subscription_data: {
+      metadata: { line_group_id: lineGroupId },
+    },
+  });
+  return { url: session.url };
+}
+
+/** line_groups に未登録なら free で 1 件挿入（Webhook で UPDATE しやすくするため） */
+async function ensureGroupRow(lineGroupId) {
+  if (!supabase) return;
+  await supabase.from('line_groups').upsert(
+    { line_group_id: lineGroupId, plan: 'free' },
+    { onConflict: 'line_group_id', ignoreDuplicates: true }
+  );
 }
 
 // ========== OpenAI 呼び出し ==========
@@ -102,6 +169,44 @@ async function handleEvent(event) {
   const userId = event.source.userId;
   const text = event.message.text.trim();
   const replyToken = event.replyToken;
+
+  // ---------- グループ判定：個人チャットでは案内のみ ----------
+  if (!isGroupEvent(event)) {
+    await lineClient.replyMessage(replyToken, {
+      type: 'text',
+      text: 'レオンくんはスタッフのLINEグループに招待してご利用ください。グループで「【モード切替：メール】」や「【モード切替：クチコミ】」からお試しください。',
+    });
+    return;
+  }
+
+  const groupId = getGroupId(event);
+
+  // ---------- 課金チェック：未契約なら課金案内 or Checkout URL 返却 ----------
+  const premium = await isGroupPremium(groupId);
+  if (!premium) {
+    if (text === '課金する') {
+      try {
+        await ensureGroupRow(groupId);
+        const { url } = await createCheckoutSessionForGroup(groupId);
+        await lineClient.replyMessage(replyToken, {
+          type: 'text',
+          text: `お支払いページはこちらです。代表者の方が完了してください。\n割引クーポンをお持ちの方は支払い画面でご利用いただけます。\n\n${url}`,
+        });
+      } catch (err) {
+        console.error('createCheckoutSessionForGroup error:', err);
+        await lineClient.replyMessage(replyToken, {
+          type: 'text',
+          text: '申し訳ございません。お支払いページの作成に失敗しました。しばらく経ってから「課金する」と再度送ってください。',
+        });
+      }
+      return;
+    }
+    await lineClient.replyMessage(replyToken, {
+      type: 'text',
+      text: 'このグループでAI機能をご利用いただくには、月額課金が必要です。割引クーポンをお持ちの方は支払い画面でご利用いただけます。代表者の方は「課金する」と送ってください。',
+    });
+    return;
+  }
 
   const state = getState(userId);
 
@@ -203,6 +308,14 @@ const app = express();
 // ヘルスチェック（Render や LB 用）
 app.get('/', (req, res) => {
   res.send('返信代行 レオンくん is running.');
+});
+
+// Stripe Checkout 完了・キャンセル後のリダイレクト用（代表者がブラウザで開く）
+app.get('/subscription/success', (req, res) => {
+  res.send('<p>お支払いが完了しました。LINEのグループでレオンくんをそのままお使いください。</p>');
+});
+app.get('/subscription/cancel', (req, res) => {
+  res.send('<p>お支払いをキャンセルしました。また「課金する」と送っていただければお申し込みいただけます。</p>');
 });
 
 // LINE Webhook：署名検証付き。body parser は middleware が担当するため、ここでは未使用
